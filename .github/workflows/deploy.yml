@@ -32,8 +32,14 @@ jobs:
             --alias ci-org \
             --set-default
 
+      - name: Validate deployment (check-only, no changes made)
+        run: |
+          sf project deploy validate \
+            --target-org validate-org \
+            --test-level RunLocalTests
+  
       - name: Deploy source to org
-        run: sf project deploy start --target-org ci-org
+        run: sf project deploy start --target-org AGENTFORCE
 
       - name: Cleanup key file
         if: always()
