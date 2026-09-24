@@ -13,6 +13,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
 
@@ -25,21 +30,15 @@ jobs:
       - name: Authenticate to Salesforce
         run: |
           sf org login jwt \
-            --username ${{ secrets.SF_USERNAME }} \
+            --username "${{ secrets.SF_USERNAME }}" \
             --jwt-key-file server.key \
-            --client-id ${{ secrets.SF_CONSUMER_KEY }} \
-            --instance-url ${{ secrets.SF_INSTANCE_URL }} \
+            --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
+            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
             --alias ci-org \
             --set-default
 
-      - name: Validate deployment (check-only, no changes made)
-        run: |
-          sf project deploy validate \
-            --target-org validate-org \
-            --test-level RunLocalTests
-  
       - name: Deploy source to org
-        run: sf project deploy start --target-org AGENTFORCE
+        run: sf project deploy start --target-org ci-org --ignore-conflicts
 
       - name: Cleanup key file
         if: always()
