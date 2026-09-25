@@ -1,45 +1,218 @@
-name: Deploy to Salesforce
+# .github/workflows/salesforce-ci-cd.yml
+#
+# Salesforce CI/CD pipeline for GitHub Actions.
+#
+# Pattern:
+#   - Open/updated PRs against `main` -> VALIDATE ONLY (dry-run, checkOnly=true)
+#     and save the returned validation Job ID as a hidden PR comment.
+#   - PR merged into `main`            -> QUICK DEPLOY using that saved Job ID
+#     (skips re-running Apex tests since they already passed at validation time).
+#   - Falls back to a normal deploy if the saved Job ID has expired or is missing.
+#
+# Auth: JWT Bearer flow (no interactive login, no stored username/password).
+#
+# ---------------------------------------------------------------------------
+# REQUIRED SETUP (one-time):
+#
+# 1. Create a Connected App in Salesforce with a digital certificate
+#    (Setup > App Manager > New Connected App > Enable OAuth > Use digital
+#    signature > upload your server.crt public certificate).
+#
+# 2. Generate a self-signed cert/key pair locally:
+#      openssl req -x509 -sha256 -nodes -days 3650 \
+#        -newkey rsa:2048 -keyout server.key -out server.crt
+#
+# 3. Add these as GitHub repo secrets (Settings > Secrets and variables > Actions):
+#      SF_CONSUMER_KEY      -> Connected App's Consumer Key
+#      SF_JWT_KEY           -> full contents of server.key (private key, PEM format)
+#      SF_USERNAME          -> Salesforce username to authenticate as
+#
+#    Optional, only if deploying to a sandbox rather than production:
+#      SF_INSTANCE_URL      -> e.g. https://test.salesforce.com
+#
+# 4. Add a repo variable (or secret) for coverage threshold if you want it
+#    configurable: MIN_CODE_COVERAGE (defaults to 75 below).
+# ---------------------------------------------------------------------------
+
+name: Salesforce CI/CD
 
 on:
-  push:
+  pull_request:
     branches: [main]
-  workflow_dispatch:
+    types: [opened, synchronize, reopened, closed]
+
+env:
+  MIN_CODE_COVERAGE: 75
 
 jobs:
-  deploy:
+  # =========================================================================
+  # JOB 1 — VALIDATE (runs on every open/updated PR, dry-run only)
+  #
+  # concurrency: a new push to the same PR cancels any validation still
+  # running for that PR, so you never validate a stale commit or waste
+  # runner time on a superseded push.
+  # =========================================================================
+  validate:
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
-
+    concurrency:
+      group: sf-validate-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
 
-      - name: Verify CLI installation
-        run: sf --version
-
-      - name: Write JWT key to file
-        run: echo "${{ secrets.SF_JWT_KEY }}" > server.key
-
-      - name: Authenticate to Salesforce
+      - name: Authenticate via JWT
         run: |
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
           sf org login jwt \
-            --username "${{ secrets.SF_USERNAME }}" \
-            --jwt-key-file server.key \
             --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
-            --instance-url "${{ secrets.SF_INSTANCE_URL }}" \
-            --alias ci-org \
+            --jwt-key-file server.key \
+            --username "${{ secrets.SF_USERNAME }}" \
+            --instance-url "${{ secrets.SF_INSTANCE_URL || 'https://login.salesforce.com' }}" \
+            --alias target-org \
             --set-default
 
-      - name: Deploy source to org
-        run: sf project deploy start --target-org ci-org --ignore-conflicts
+      - name: Validate deployment (check-only, run local tests)
+        id: validate_deploy
+        run: |
+          sf project deploy validate \
+            --source-dir force-app \
+            --test-level RunLocalTests \
+            --target-org target-org \
+            --json > validate-result.json || true
 
-      - name: Cleanup key file
-        if: always()
-        run: rm -f server.key
+          cat validate-result.json
+
+          JOB_ID=$(jq -r '.result.id // empty' validate-result.json)
+          STATUS=$(jq -r '.result.status // "Failed"' validate-result.json)
+
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATUS" != "Succeeded" ]; then
+            echo "::error::Validation failed with status $STATUS"
+            exit 1
+          fi
+
+      - name: Check code coverage
+        run: |
+          COVERAGE=$(jq -r '.result.details.runTestResult.codeCoverage
+            | map(.numLocationsNotCovered as $u | .numLocations as $t
+              | {covered: ($t - $u), total: $t})
+            | (map(.covered) | add) / (map(.total) | add) * 100' \
+            validate-result.json 2>/dev/null || echo "0")
+
+          echo "Overall coverage: $COVERAGE%"
+          awk -v cov="$COVERAGE" -v min="$MIN_CODE_COVERAGE" \
+            'BEGIN { exit (cov+0 < min+0) ? 1 : 0 }' \
+            || { echo "::error::Coverage $COVERAGE% is below the required $MIN_CODE_COVERAGE%"; exit 1; }
+
+      - name: Post validation Job ID as hidden PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobId = "${{ steps.validate_deploy.outputs.job_id }}";
+            const marker = "<!-- sf-validation-id -->";
+            const body = `${marker}\nValidation Job ID: \`${jobId}\`\nValidated at: ${new Date().toISOString()}`;
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.data.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  # =========================================================================
+  # JOB 2 — DEPLOY (runs only when the PR is merged into main)
+  # =========================================================================
+  deploy:
+    if: github.event.pull_request.merged == true && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: sf-deploy-${{ github.ref }}
+      cancel-in-progress: false   # never cancel a deployment already in progress
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Authenticate via JWT
+        run: |
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
+          sf org login jwt \
+            --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
+            --jwt-key-file server.key \
+            --username "${{ secrets.SF_USERNAME }}" \
+            --instance-url "${{ secrets.SF_INSTANCE_URL || 'https://login.salesforce.com' }}" \
+            --alias target-org \
+            --set-default
+
+      - name: Read validation Job ID from PR comments
+        id: read_job_id
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = "<!-- sf-validation-id -->";
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const match = comments.data.find(c => c.body.includes(marker));
+            const jobId = match ? match.body.match(/Validation Job ID: `([^`]+)`/)?.[1] : "";
+            core.setOutput("job_id", jobId || "");
+
+      - name: Quick Deploy (reuse validated Job ID, skips re-testing)
+        id: quick_deploy
+        if: steps.read_job_id.outputs.job_id != ''
+        continue-on-error: true
+        run: |
+          sf project deploy quick \
+            --job-id "${{ steps.read_job_id.outputs.job_id }}" \
+            --target-org target-org
+
+      - name: Fallback — full deploy if Quick Deploy failed or Job ID missing
+        if: steps.read_job_id.outputs.job_id == '' || steps.quick_deploy.outcome == 'failure'
+        run: |
+          echo "::warning::Falling back to full deploy (Quick Deploy unavailable or expired)"
+          sf project deploy start \
+            --source-dir force-app \
+            --test-level RunLocalTests \
+            --target-org target-org \
+            --wait 30
+
+      - name: Deploy pre/post destructive changes (if present)
+        run: |
+          if [ -f "destructiveChanges/destructiveChangesPre.xml" ]; then
+            sf project deploy start \
+              --manifest destructiveChanges/destructiveChangesPre.xml \
+              --target-org target-org
+          fi
+          if [ -f "destructiveChanges/destructiveChangesPost.xml" ]; then
+            sf project deploy start \
+              --manifest destructiveChanges/destructiveChangesPost.xml \
+              --target-org target-org
+          fi
